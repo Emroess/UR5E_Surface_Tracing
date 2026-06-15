@@ -1,0 +1,30 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+env/
+venv/
+ENV/
+.venv/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Logs / data from runs
+logs/
+*.log
+*.csv
+*.npy
+*.png
+
+# OS
+.DS_Store
+Thumbs.db
+
+# UR specific temp
+*.urp   # Polyscope programs if exported
