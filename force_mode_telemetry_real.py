@@ -52,19 +52,42 @@ import sys
 
 HOST = "192.168.1.2"
 
-# ====================== FORCE MODE PARAMS (Y + Z compliant, 0 mm approach, 5 N in Y+Z) ======================
+# ====================== FORCE MODE PARAMS (Z-only compliant, 0 mm approach, 5 N in Z) ======================
 TASK_FRAME = [0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
-SELECTION = [0, 1, 1, 0, 0, 0]          # Compliant (force-controlled) in Y and Z
+SELECTION = [0, 0, 1, 0, 0, 0]          # Compliant (force-controlled) in Z only
+
+# SELECTION indexing for force_mode():
+# The selection_vector is always indexed as the 6 DOF of the task_frame:
+#   [0] = X   (linear)
+#   [1] = Y   (linear)
+#   [2] = Z   (linear)
+#   [3] = Rx  (rotation about X)
+#   [4] = Ry  (rotation about Y)
+#   [5] = Rz  (rotation about Z)
+# This is standard XYZ + RXYZ order (NOT yzx or any permutation).
+# 1 = compliant/force-controlled in that axis; 0 = position-controlled.
 
 # Real surface targets (used when FREE_AIR_TEST = False)
-# NOTE: Commanding force in the "travel" direction (Y here) often causes the arm to deviate
-# or drift from the taught path because the force controller prioritizes wrench over position
-# in compliant axes. For initial surface tracing tests, strongly consider setting Y component
-# to 0.0 (compliance/give in Y, active force only in Z).
-WRENCH = [0.0, 5.0, 5.0, 0.0, 0.0, 0.0]  # 5 N in Y + 5 N in Z while tracing
+# NOTE: Only Z is force-controlled here. Y (and X + rotations) are position-controlled.
+WRENCH = [0.0, 0.0, 5.0, 0.0, 0.0, 0.0]  # 5 N in Z (the only compliant axis)
+
+# === Payload (TCP mass) for gravity compensation ===
+# This is VERY IMPORTANT for force_mode to work correctly.
+# The robot uses this to know "how much of the sensor reading is just my tool weight + motion"
+# vs. "actual external contact force".
+#
+# If PAYLOAD_MASS is too low  → force_mode will think there is extra "external" force from gravity.
+# If PAYLOAD_MASS is too high → force_mode will under-compensate and may not reach your target force.
+#
+# You can tune this variable during development to see its effect.
+# In production you should measure the real tool + gripped part as accurately as possible
+# (use a scale for mass, and find CoG by balancing or CAD).
+PAYLOAD_MASS = 1.2          # kg (total mass at the tool)
+PAYLOAD_COG = [0.0, 0.0, 0.08]   # [x, y, z] in meters from the tool flange (TCP origin)
+# You can also add inertia if you want full accuracy: set_payload(mass, CoG, [Ixx, Iyy, Izz, Ixy, Ixz, Iyz])
 
 # Set this to True when testing the motion sequence in open air (no surface).
-# This makes force_mode compliant in Y+Z but with ZERO force targets,
+# This makes force_mode compliant in Z but with ZERO force targets,
 # so the arm does not actively drive/drift trying to "push" with 5 N.
 # Set to False only when the start pose itself will put the tool in contact with a real surface.
 FREE_AIR_TEST = True
@@ -132,6 +155,7 @@ def main():
     print(f"  Type:      {FORCE_TYPE}")
     print(f"  Damping:   {DAMPING}")
     print(f"  Gain:      {GAIN_SCALING}")
+    print(f"  Payload:   {PAYLOAD_MASS} kg @ CoG {PAYLOAD_COG}")
     print(f"Start joints (rad): {START_JOINTS}")
     print(f"End joints (rad):   {END_JOINTS}")
     print()
@@ -148,7 +172,7 @@ def main():
     # Sequence:
     #   - Reach start pose
     #   - 0 mm additional approach (no down move)
-    #   - Then trace while force_mode is active in Y+Z
+    #   - Then trace while force_mode is active (Z compliant with force target)
     #
     # Note: With 0 mm approach, the start pose itself must position the tool in contact
     # with the surface (when FREE_AIR_TEST=False) so the surface can react to the force targets.
@@ -156,30 +180,46 @@ def main():
 
     force_script = f"""
 def force_trace_real():
+    textmsg("PROGRAM START - force_trace_real()")
+
     # 1. Move to the taught start pose (position the tool near the surface).
+    textmsg("Moving to START pose")
     movej([{START_JOINTS[0]}, {START_JOINTS[1]}, {START_JOINTS[2]}, {START_JOINTS[3]}, {START_JOINTS[4]}, {START_JOINTS[5]}], a=1.0, v=0.5)
     sleep(1.0)
+    textmsg("Reached START pose")
+
+    # Set the payload (mass + CoG) that the controller will use for gravity compensation.
+    # This must be reasonably accurate for force_mode to correctly separate
+    # "tool weight" from "external contact force".
+    set_payload({PAYLOAD_MASS}, [{PAYLOAD_COG[0]},{PAYLOAD_COG[1]},{PAYLOAD_COG[2]}])
+    textmsg("Payload set: mass=" + to_str({PAYLOAD_MASS}))
 
     # 2. APPROACH: 0 mm additional move (no down). 
     #    The start pose is expected to already have the tool in (or very near) contact.
     #    If you need a small approach later, change the offset below (e.g. -0.015 for 15 mm down in base -Z).
+    textmsg("Starting 0mm APPROACH")
     approach = p[0.0, 0.0, 0.0, 0.0, 0.0, 0.0]   # 0 mm
     movel(pose_add(get_actual_tcp_pose(), approach), a=0.12, v=0.025)
     sleep(0.5)   # short settle pause (reduced because no movement)
+    textmsg("0mm APPROACH complete")
 
     # 3. Zero the force/torque sensor (ideally while the tool is in light contact with the surface at the start pose).
+    textmsg("Zeroing F/T sensor")
     zero_ftsensor()
+    textmsg("F/T sensor zeroed")
 
     force_mode_set_damping({DAMPING})
     force_mode_set_gain_scaling({GAIN_SCALING})
+    textmsg("Damping and Gain set")
 
     # 4. Enable force mode.
-    #    If FREE_AIR_TEST=True (current): zero wrench targets → pure compliance in Y+Z.
+    #    If FREE_AIR_TEST=True (current): zero wrench targets → pure compliance in Z.
     #      The arm should remain stable after the start pose and complete the move to end pose.
-    #    If FREE_AIR_TEST=False: actively applies 5 N in Y + 5 N in Z.
+    #    If FREE_AIR_TEST=False: actively applies 5 N in Z (the only compliant axis).
     #      REQUIRES the start pose itself to put the tool in contact with the surface.
-    #      Without a reaction force the arm will drift in the compliant directions
+    #      Without a reaction force the arm will drift in the Z direction
     #      (this is normal force_mode behavior when nothing pushes back).
+    textmsg("Enabling force_mode with Z target")
     force_mode(
         p[{TASK_FRAME[0]},{TASK_FRAME[1]},{TASK_FRAME[2]},{TASK_FRAME[3]},{TASK_FRAME[4]},{TASK_FRAME[5]}],
         [{SELECTION[0]},{SELECTION[1]},{SELECTION[2]},{SELECTION[3]},{SELECTION[4]},{SELECTION[5]}],
@@ -187,27 +227,34 @@ def force_trace_real():
         {FORCE_TYPE},
         [{LIMITS[0]},{LIMITS[1]},{LIMITS[2]},{LIMITS[3]},{LIMITS[4]},{LIMITS[5]}]
     )
+    textmsg("force_mode ENABLED")
 
     # 5. Trace / slide to end pose while force_mode is active.
-    #    IMPORTANT: Because Y and Z are compliant, the force controller will continuously
-    #    adjust the position/velocity in those axes to achieve the target wrench.
-    #    The movej will be followed primarily in the non-compliant axes (X + rotations).
-    #    If the taught end joints require a position in Y or Z that conflicts with
+    #    IMPORTANT: Because Z is compliant, the force controller will continuously
+    #    adjust the position/velocity in Z to achieve the target wrench.
+    #    The movej will be followed primarily in the non-compliant axes (X, Y + rotations).
+    #    If the taught end joints require a Z position that conflicts with
     #    maintaining 5N, the arm will deviate from the pure joint trajectory (this appears as "drift").
     #    This is expected behavior. The arm is trying to satisfy the force targets.
     #
     #    Tips to reach closer to end pose:
-    #    - Use lower Y wrench (even 0) so the path in Y is followed more closely.
     #    - Teach the END_JOINTS while force_mode is already active and tool is pressed
     #      against the surface (so the joints already incorporate the compliant offset).
     #    - Use very low speed (current TRACE_VEL).
+    textmsg("Starting TRACE move to END pose")
     movej([{END_JOINTS[0]}, {END_JOINTS[1]}, {END_JOINTS[2]}, {END_JOINTS[3]}, {END_JOINTS[4]}, {END_JOINTS[5]}], a={TRACE_ACC}, v={TRACE_VEL})
+    textmsg("TRACE movej completed")
 
     # Dwell at the end with force mode still active.
+    textmsg("Starting DWELL with force active")
     sleep({POST_TRACE_DWELL})
+    textmsg("DWELL complete")
 
+    textmsg("Ending force_mode and stopping")
     end_force_mode()
     stopl(1.5)
+
+    textmsg("PROGRAM END - force_trace_real() finished")
 end
 force_trace_real()
 """
