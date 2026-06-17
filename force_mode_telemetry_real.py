@@ -2,20 +2,16 @@
 """
 force_mode_telemetry_real.py
 
-Zero-dependency script for a **real UR5e** arm.
-
 - Enables built-in force_mode via URScript (Secondary Client, port 30002).
-- Streams live force/torque telemetry from the robot's **integrated 6-axis FT sensor**
+- Streams live force/torque telemetry from the robot's integrated 6-axis FT sensor
   using the real-time client interface (port 30003). No RTDE library required.
-- Uses the exact same force-mode tunable variables as the URSim version for easy
-  transfer of settings.
 
 Target:
   Polyscope IP: 192.168.1.2
   Standard UR ports (30002 commands, 30003 real-time telemetry).
 
 Requirements:
-  - Pure Python 3 stdlib only (socket, struct, time, sys). No pip packages.
+  - Python 3
 
 Setup on the real robot (Polyscope):
   1. Power on the UR5e.
@@ -27,10 +23,6 @@ Setup on the real robot (Polyscope):
 
 Usage:
   python force_mode_telemetry_real.py
-
-Force mode parameters are at the top for easy editing (same names as the sim version).
-
-Ctrl-C cleanly disables force mode and stops the robot.
 
 Safety notes for real hardware:
   - Start with LOW force values (e.g. 5-10 N) and slow motion.
@@ -52,9 +44,9 @@ import sys
 
 HOST = "192.168.1.2"
 
-# ====================== FORCE MODE PARAMS (Z-only compliant, 0 mm approach, 5 N in Z) ======================
+# ====================== FORCE MODE PARAMS  ======================
 TASK_FRAME = [0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
-SELECTION = [0, 0, 1, 0, 0, 0]          # Compliant (force-controlled) in Z only
+SELECTION = [0, 0, 1, 0, 0, 0]
 
 # SELECTION indexing for force_mode():
 # The selection_vector is always indexed as the 6 DOF of the task_frame:
@@ -68,65 +60,43 @@ SELECTION = [0, 0, 1, 0, 0, 0]          # Compliant (force-controlled) in Z only
 # 1 = compliant/force-controlled in that axis; 0 = position-controlled.
 
 # Real surface targets (used when FREE_AIR_TEST = False)
-# NOTE: Only Z is force-controlled here. Y (and X + rotations) are position-controlled.
-WRENCH = [0.0, 0.0, 5.0, 0.0, 0.0, 0.0]  # 5 N in Z (the only compliant axis)
-
-# === Payload (TCP mass) for gravity compensation ===
-# This is VERY IMPORTANT for force_mode to work correctly.
-# The robot uses this to know "how much of the sensor reading is just my tool weight + motion"
-# vs. "actual external contact force".
-#
-# If PAYLOAD_MASS is too low  → force_mode will think there is extra "external" force from gravity.
-# If PAYLOAD_MASS is too high → force_mode will under-compensate and may not reach your target force.
-#
-# You can tune this variable during development to see its effect.
-# In production you should measure the real tool + gripped part as accurately as possible
-# (use a scale for mass, and find CoG by balancing or CAD).
-PAYLOAD_MASS = 1.2          # kg (total mass at the tool)
-PAYLOAD_COG = [0.0, 0.0, 0.08]   # [x, y, z] in meters from the tool flange (TCP origin)
-# You can also add inertia if you want full accuracy: set_payload(mass, CoG, [Ixx, Iyy, Izz, Ixy, Ixz, Iyz])
+WRENCH = [0.0, 0.0, 5.0, 0.0, 0.0, 0.0] 
 
 # Set this to True when testing the motion sequence in open air (no surface).
-# This makes force_mode compliant in Z but with ZERO force targets,
-# so the arm does not actively drive/drift trying to "push" with 5 N.
+# This makes force_mode compliant in the set axes but with ZERO force targets,
+# so the arm does not actively drive/drift trying to "push" with nonzero forces.
 # Set to False only when the start pose itself will put the tool in contact with a real surface.
 FREE_AIR_TEST = True
 
-FORCE_TYPE = 2                            # 2 = base/world frame
+FORCE_TYPE = 2 # 2 = base/world frame
 
 # LIMITS for real hardware contact:
-#   - Non-compliant axis (X): maximum allowed deviation from the commanded path (m)
-#   - Compliant axes (Y, Z): maximum speed the force controller is allowed to use to correct the force error (m/s)
+#   - Non-compliant axis: maximum allowed deviation from the commanded path (m)
+#   - Compliant axes: maximum speed the force controller is allowed to use to correct the force error (m/s)
 #     Keep these LOW when two axes are compliant to avoid fast diving or oscillation.
 LIMITS = [0.10, 0.04, 0.04, 0.17, 0.17, 0.17]
 
 # Force controller tuning - MUST be called before force_mode()
-DAMPING = 0.80          # Good starting point with 5 N targets in two axes. Raise to 0.85-0.9 if you see oscillation on contact.
-GAIN_SCALING = 0.90     # Balanced starting value for 5 N press while tracing. Raise toward 1.0 if force response feels too soft.
+DAMPING = 0.80         
+GAIN_SCALING = 0.90    
 
-# Start pose (joint positions in radians).
-# IMPORTANT: Replace these with actual joint positions taught on the real UR5e
-# (read from the Polyscope Move tab or use the "get actual joint positions" feature).
+# Start pose (joint positions in radians)..
 START_JOINTS = [1.675, -2.219, -0.981, 0.460, 1.525, -0.033]
 
 # End pose (joint positions in radians) for the surface trace motion.
-# IMPORTANT: Replace these with actual joint positions taught on the real UR5e.
 END_JOINTS = [1.675, -2.451, -1.068, 0.938, 1.525, -0.033]
 # ================================================================================================
 
 # Motion speeds WHILE FORCE MODE IS ACTIVE (the sliding portion of the trace).
-# These must be low when two axes are compliant — fast motion excites oscillation
-# and makes it harder for the force controller to maintain the targets.
 TRACE_ACC = 0.15
-TRACE_VEL = 0.02        # Very slow (2 cm/s) for tracing under force control. Start here.
+TRACE_VEL = 0.02
 
-# Dwell at the end pose with force_mode still active (surface reaction keeps the force regulated).
+# Dwell at the end pose with force_mode still active.
 POST_TRACE_DWELL = 2.0
 
 
 def send_script(script: str, host: str = HOST, port: int = 30002, timeout: float = 5.0):
     """Send URScript over the Secondary Client interface (port 30002).
-    This is the zero-dependency way to command the robot (no RTDE library needed).
     """
     try:
         with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
@@ -155,7 +125,6 @@ def main():
     print(f"  Type:      {FORCE_TYPE}")
     print(f"  Damping:   {DAMPING}")
     print(f"  Gain:      {GAIN_SCALING}")
-    print(f"  Payload:   {PAYLOAD_MASS} kg @ CoG {PAYLOAD_COG}")
     print(f"Start joints (rad): {START_JOINTS}")
     print(f"End joints (rad):   {END_JOINTS}")
     print()
@@ -180,46 +149,22 @@ def main():
 
     force_script = f"""
 def force_trace_real():
-    textmsg("PROGRAM START - force_trace_real()")
-
     # 1. Move to the taught start pose (position the tool near the surface).
-    textmsg("Moving to START pose")
     movej([{START_JOINTS[0]}, {START_JOINTS[1]}, {START_JOINTS[2]}, {START_JOINTS[3]}, {START_JOINTS[4]}, {START_JOINTS[5]}], a=1.0, v=0.5)
     sleep(1.0)
-    textmsg("Reached START pose")
-
-    # Set the payload (mass + CoG) that the controller will use for gravity compensation.
-    # This must be reasonably accurate for force_mode to correctly separate
-    # "tool weight" from "external contact force".
-    set_payload({PAYLOAD_MASS}, [{PAYLOAD_COG[0]},{PAYLOAD_COG[1]},{PAYLOAD_COG[2]}])
-    textmsg("Payload set: mass=" + to_str({PAYLOAD_MASS}))
 
     # 2. APPROACH: 0 mm additional move (no down). 
-    #    The start pose is expected to already have the tool in (or very near) contact.
-    #    If you need a small approach later, change the offset below (e.g. -0.015 for 15 mm down in base -Z).
-    textmsg("Starting 0mm APPROACH")
     approach = p[0.0, 0.0, 0.0, 0.0, 0.0, 0.0]   # 0 mm
     movel(pose_add(get_actual_tcp_pose(), approach), a=0.12, v=0.025)
-    sleep(0.5)   # short settle pause (reduced because no movement)
-    textmsg("0mm APPROACH complete")
+    sleep(0.5)   # short settle pause.
 
     # 3. Zero the force/torque sensor (ideally while the tool is in light contact with the surface at the start pose).
-    textmsg("Zeroing F/T sensor")
     zero_ftsensor()
-    textmsg("F/T sensor zeroed")
 
     force_mode_set_damping({DAMPING})
     force_mode_set_gain_scaling({GAIN_SCALING})
-    textmsg("Damping and Gain set")
 
     # 4. Enable force mode.
-    #    If FREE_AIR_TEST=True (current): zero wrench targets → pure compliance in Z.
-    #      The arm should remain stable after the start pose and complete the move to end pose.
-    #    If FREE_AIR_TEST=False: actively applies 5 N in Z (the only compliant axis).
-    #      REQUIRES the start pose itself to put the tool in contact with the surface.
-    #      Without a reaction force the arm will drift in the Z direction
-    #      (this is normal force_mode behavior when nothing pushes back).
-    textmsg("Enabling force_mode with Z target")
     force_mode(
         p[{TASK_FRAME[0]},{TASK_FRAME[1]},{TASK_FRAME[2]},{TASK_FRAME[3]},{TASK_FRAME[4]},{TASK_FRAME[5]}],
         [{SELECTION[0]},{SELECTION[1]},{SELECTION[2]},{SELECTION[3]},{SELECTION[4]},{SELECTION[5]}],
@@ -227,7 +172,6 @@ def force_trace_real():
         {FORCE_TYPE},
         [{LIMITS[0]},{LIMITS[1]},{LIMITS[2]},{LIMITS[3]},{LIMITS[4]},{LIMITS[5]}]
     )
-    textmsg("force_mode ENABLED")
 
     # 5. Trace / slide to end pose while force_mode is active.
     #    IMPORTANT: Because Z is compliant, the force controller will continuously
@@ -236,25 +180,13 @@ def force_trace_real():
     #    If the taught end joints require a Z position that conflicts with
     #    maintaining 5N, the arm will deviate from the pure joint trajectory (this appears as "drift").
     #    This is expected behavior. The arm is trying to satisfy the force targets.
-    #
-    #    Tips to reach closer to end pose:
-    #    - Teach the END_JOINTS while force_mode is already active and tool is pressed
-    #      against the surface (so the joints already incorporate the compliant offset).
-    #    - Use very low speed (current TRACE_VEL).
-    textmsg("Starting TRACE move to END pose")
     movej([{END_JOINTS[0]}, {END_JOINTS[1]}, {END_JOINTS[2]}, {END_JOINTS[3]}, {END_JOINTS[4]}, {END_JOINTS[5]}], a={TRACE_ACC}, v={TRACE_VEL})
-    textmsg("TRACE movej completed")
 
     # Dwell at the end with force mode still active.
-    textmsg("Starting DWELL with force active")
     sleep({POST_TRACE_DWELL})
-    textmsg("DWELL complete")
 
-    textmsg("Ending force_mode and stopping")
     end_force_mode()
     stopl(1.5)
-
-    textmsg("PROGRAM END - force_trace_real() finished")
 end
 force_trace_real()
 """
@@ -265,7 +197,7 @@ force_trace_real()
         return 1
     print("Force mode command sent. The program is now running on the controller.\n")
 
-    # Brief pause so the robot program starts executing before we connect for telemetry
+    # Pause so the robot program starts executing before we connect for telemetry
     time.sleep(0.8)
 
     # 2. Receive force telemetry from the real-time interface (port 30003).
