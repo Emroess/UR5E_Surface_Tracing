@@ -1,0 +1,247 @@
+# Surface Trace with Joint-Space Torque Impedance Control
+# Based on joint_impedance_cartesian_circle_motion.script (direct_torque + computed torque)
+# Requires Polyscope 5.22+ with direct_torque() support
+#
+# Behavior:
+#   1. Move to taught start pose (joints)
+#   2. Zero built-in F/T sensor
+#   3. Trace along tool +Y for trace_length_m while tool +Z is force-compliant
+#   4. Stop cleanly (exit torque mode, optional retract)
+#
+# Frames:
+#   - Path and compliance are defined in the TOOL frame captured at trace start (trace_origin).
+#   - X/Y path motion is along tool Y; Z compliance is along tool Z (EE-relative).
+
+# =============================================================================
+# TASK CONFIGURATION — edit these before running
+# =============================================================================
+
+# Start joint configuration (rad) — teach in Polyscope and paste values here
+start_joints = [1.675, -2.219, -0.981, 0.460, 1.525, -0.033]
+
+trace_length_m = 0.15       # Distance to travel along tool +Y (meters)
+path_speed = 0.03           # Tangential speed along tool Y (m/s)
+
+# Normal-axis (tool Z) force compliance
+F_des = 10.0                # Target force along tool +Z (N)
+Ki_z = 0.0003               # Integrator gain on force error (tune)
+Kd_z = 0.00005              # Damping on measured Fz (optional)
+Kf_z = 0.002                # Cartesian force feedback gain into torque (Nm/N)
+z_offset_max = 0.015        # Max compliance offset along tool Z (m)
+
+# Safety
+F_contact_max = 40.0        # Abort trace if |Fz_tool| exceeds this (N)
+
+retract_z_m = 0.015         # Retract along tool -Z after trace (m), position mode
+
+# =============================================================================
+# ROBOT DETECTION & JOINT IMPEDANCE GAINS
+# =============================================================================
+
+max_torque_ur3_spec = [56.0, 56.0, 28.0, 9.0, 9.0, 9.0]
+
+robot_reach = get_forward_kin([0, 0, 0, 0, 0, 0])
+reach = norm(robot_reach[0])
+
+if reach < 0.5:
+    # UR3e
+    max_torque = max_torque_ur3_spec / 4
+    Kp = [1000, 1000, 500, 100, 100, 100] * 0.7
+    speed_ramp_up = 0.05
+elif reach < 1.0:
+    # UR5e
+    max_torque = max_torque_ur3_spec / 2
+    Kp = [1000, 1000, 500, 100, 100, 100]
+    speed_ramp_up = 0.005
+else
+    # UR10e or longer
+    max_torque = max_torque_ur3_spec
+    Kp = [1000, 1000, 500, 100, 100, 100] * 1.3
+    speed_ramp_up = 0.005
+end
+
+Kd = [2 * sqrt(Kp[0]), 2 * sqrt(Kp[1]), 2 * sqrt(Kp[2]), 2 * sqrt(Kp[3]), 2 * sqrt(Kp[4]), 2 * sqrt(Kp[5])]
+if reach >= 1.0:
+    Kd = Kd * 1.3
+end
+
+# =============================================================================
+# UTILITY FUNCTIONS
+# =============================================================================
+
+def clampArray(value, clampValue):
+    pdiff = value - clampValue
+    mdiff = value + clampValue
+    ret = value
+    j = 0
+    while j < length(value):
+        if pdiff[j] > 0:
+            ret[j] = clampValue[j]
+        elif mdiff[j] < 0:
+            ret[j] = -clampValue[j]
+        end
+        j = j + 1
+    end
+    return ret
+end
+
+def clamp_scalar(x, lo, hi):
+    if x > hi:
+        return hi
+    elif x < lo:
+        return lo
+    end
+    return x
+end
+
+def screw_trans(t, v):
+    local_vw = wrench_trans(t, [v[3], v[4], v[5], v[0], v[1], v[2]])
+    return [local_vw[3], local_vw[4], local_vw[5], local_vw[0], local_vw[1], local_vw[2]]
+end
+
+# =============================================================================
+# PATH (tool frame): motion along +Y, Z from compliance integrator
+# =============================================================================
+
+def get_path_state_tool(s):
+    path_p = p[0, s, 0, 0, 0, 0]
+    path_v = [0, path_speed, 0, 0, 0, 0]
+    path_a = [0, 0, 0, 0, 0, 0]
+    return struct(p=path_p, v=path_v, a=path_a)
+end
+
+# =============================================================================
+# TOOL-Z COMPLIANCE (wrench read in tool / EE frame)
+# =============================================================================
+
+def update_z_compliance_tool():
+    global z_offset = z_offset
+
+    tcp = get_actual_tcp_pose()
+    wrench_tool = wrench_trans(pose_inv(tcp), get_tcp_force())
+    f_err = F_des - wrench_tool[2]
+
+    z_offset = z_offset + Ki_z * f_err * get_steptime()
+    z_offset = z_offset - Kd_z * wrench_tool[2] * get_steptime()
+    z_offset = clamp_scalar(z_offset, -z_offset_max, z_offset_max)
+
+    return struct(f_err=f_err, f_meas=wrench_tool[2])
+end
+
+# =============================================================================
+# TRAJECTORY -> JOINT TARGETS
+# =============================================================================
+
+def compute_joint_targets(trace_origin, path_state, z_offset, speed_scale, q_prev):
+    des_tool = pose_trans(path_state.p, p[0, 0, z_offset, 0, 0, 0])
+    next_pos = pose_trans(trace_origin, des_tool)
+
+    target_q = get_inverse_kin(next_pos, q_prev)
+    inv_jac = inv(get_jacobian(target_q))
+
+    v_des = screw_trans(trace_origin, path_state.v) * speed_scale
+    a_des = screw_trans(trace_origin, path_state.a) * speed_scale
+
+    target_qd = inv_jac * v_des
+    target_qdd = inv_jac * (a_des - get_jacobian_time_derivative(target_q) * target_qd)
+
+    return struct(q=target_q, qd=target_qd, qdd=target_qdd)
+end
+
+# =============================================================================
+# TORQUE IMPEDANCE (computed torque — gravity handled inside direct_torque)
+# =============================================================================
+
+def compute_torque(targets, f_err, tcp):
+    q = get_actual_joint_positions()
+    qd = get_actual_joint_speeds()
+
+    q_err = targets.q - q
+    q_err_d = targets.qd - qd
+
+    M = get_mass_matrix()
+    C = get_coriolis_and_centrifugal_torques()
+    J = get_jacobian(targets.q)
+
+    F_tool = [0, 0, Kf_z * f_err, 0, 0, 0]
+    F_base = wrench_trans(tcp, F_tool)
+
+    tau = M * targets.qdd + Kp * q_err + Kd * q_err_d + C + transpose(J) * F_base
+    return clampArray(tau, max_torque)
+end
+
+# =============================================================================
+# PRE-TRACE SETUP (position mode)
+# =============================================================================
+
+textmsg("surface_trace: moving to start pose")
+movej(start_joints, a=1.0, v=0.5)
+sleep(1.0)
+
+textmsg("surface_trace: zeroing F/T sensor")
+zero_ftsensor()
+sleep(0.5)
+
+# Tool frame fixed at trace start — path Y and compliant Z are EE-relative
+trace_origin = get_actual_tcp_pose()
+
+path_s = 0.0
+z_offset = 0.0
+speed_scale = 0.0
+q_prev = get_actual_joint_positions()
+trace_done = False
+fault = False
+
+textmsg("surface_trace: entering torque impedance trace")
+
+# =============================================================================
+# TORQUE TRACE LOOP
+# =============================================================================
+
+while not trace_done and not fault:
+    force_state = update_z_compliance_tool()
+    path_state = get_path_state_tool(path_s)
+    targets = compute_joint_targets(trace_origin, path_state, z_offset, speed_scale, q_prev)
+    q_prev = targets.q
+
+    tcp = get_actual_tcp_pose()
+    torque_target = compute_torque(targets, force_state.f_err, tcp)
+    direct_torque(torque_target, friction_comp=True)
+
+    if speed_scale < 1.0:
+        speed_scale = speed_scale + speed_ramp_up
+        if speed_scale > 1.0:
+            speed_scale = 1.0
+        end
+    end
+
+    path_s = path_s + path_speed * speed_scale * get_steptime()
+
+    if path_s >= trace_length_m:
+        trace_done = True
+    end
+
+    if force_state.f_meas > F_contact_max or force_state.f_meas < -F_contact_max:
+        fault = True
+        textmsg("surface_trace: FAULT — force limit exceeded")
+    end
+
+    global ms_used = get_rtde_value("actual_execution_time")
+end
+
+# =============================================================================
+# CLEAN SHUTDOWN (required when leaving direct_torque)
+# =============================================================================
+
+textmsg("surface_trace: exiting torque mode")
+stopj(2.0)
+sleep(0.3)
+
+if fault:
+    textmsg("surface_trace: stopped due to fault — check force and path")
+else
+    textmsg("surface_trace: trace complete, retracting along tool -Z")
+    retract_pose = pose_trans(get_actual_tcp_pose(), p[0, 0, -retract_z_m, 0, 0, 0])
+    movel(retract_pose, a=0.25, v=0.05)
+    textmsg("surface_trace: program finished cleanly")
+end
