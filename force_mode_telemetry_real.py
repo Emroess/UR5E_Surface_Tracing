@@ -2,7 +2,8 @@
 """
 force_mode_telemetry_real.py
 
-- Enables built-in force_mode via URScript (Secondary Client, port 30002).
+- Enables built-in force_mode via URScript (Secondary Client, port 30002) with a
+  Cartesian constant-height slide (movel) while Z force is regulated.
 - Streams live force/torque telemetry from the robot's integrated 6-axis FT sensor
   using the real-time client interface (port 30003). No RTDE library required.
 
@@ -25,11 +26,12 @@ Usage:
   python force_mode_telemetry_real.py
 
 Safety notes for real hardware:
-  - Start with LOW force values (e.g. 5-10 N) and slow motion.
-  - Approach the surface carefully; use the teach pendant E-stop as primary safety.
-  - Test force_mode in free space (no contact) first.
-  - The robot will actively press with the commanded WRENCH in the selected compliant axes
-    while following your motion in the non-compliant axes.
+  - Using TOOL frame so EE Z (per Polyscope) = compliant normal to table.
+  - Trace in tool Y (back/forward) at constant height.
+  - After trace + dwell: end_force_mode() then movej(RETRACT_JOINTS) -- you MUST edit RETRACT_JOINTS at top with a safe raised pose (jog arm up after trace, record joints).
+  - Start with LOW force (3-5 N) and slow TRACE_VEL.
+  - Test trace direction and force sign with FREE_AIR_TEST=True first.
+  - Teach start pose with tool near contact.
   - On a real surface the reaction force will be physical and the integrated sensor will
     report realistic values (unlike URSim).
 
@@ -44,31 +46,51 @@ import sys
 
 HOST = "192.168.1.2"
 
-# ====================== FORCE MODE PARAMS  ======================
+# ====================== FORCE MODE PARAMS (Z-compliant surface tracing) ======================
 TASK_FRAME = [0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
 SELECTION = [0, 0, 1, 0, 0, 0]
 
 # SELECTION indexing for force_mode():
-# The selection_vector is always indexed as the 6 DOF of the task_frame:
-#   [0] = X   (linear)
-#   [1] = Y   (linear)
-#   [2] = Z   (linear)
+# With FORCE_TYPE=1 (tool frame), the indices are in the END-EFFECTOR frame (as shown in Polyscope):
+#   [0] = X   (linear)   -- left/right per your description
+#   [1] = Y   (linear)   -- back/forward per your description
+#   [2] = Z   (linear)   -- perpendicular to table (normal to surface)
 #   [3] = Rx  (rotation about X)
 #   [4] = Ry  (rotation about Y)
 #   [5] = Rz  (rotation about Z)
-# This is standard XYZ + RXYZ order (NOT yzx or any permutation).
-# 1 = compliant/force-controlled in that axis; 0 = position-controlled.
+# 1 = compliant/force-controlled (this is the normal to the table); 0 = position-controlled (for tracing motion).
+
+# TASK_FRAME vs WRENCH (in force_mode):
+# - TASK_FRAME: A 6D pose that defines the *reference frame* (origin + orientation)
+#   in which the force control axes are interpreted. It orients the "coordinate system"
+#   for both SELECTION and WRENCH.
+#   With FORCE_TYPE=1 it is usually left as [0,0,0,0,0,0] and the axes follow the current
+#   tool frame at runtime.
+#
+# - WRENCH: The *desired force/torque values* [Fx, Fy, Fz, Tx, Ty, Tz] (N and Nm) that
+#   the robot should apply to the environment.
+#   Only the components where SELECTION=1 are actively regulated to these values.
+#   The other components are ignored for force control.
+#
+# In your current setup (tool frame + Z compliant):
+#   SELECTION[2]=1  → Z axis of the end-effector is force-controlled
+#   WRENCH[2]=5.0   → try to apply 5 N along the tool Z direction (normal to table)
+#   TASK_FRAME is [0,0,0,...] and FORCE_TYPE=1 → the wrench is expressed in the tool frame.
 
 # Real surface targets (used when FREE_AIR_TEST = False)
-WRENCH = [0.0, 0.0, 5.0, 0.0, 0.0, 0.0] 
+# With tool frame: the third component is force in EE Z (normal to table).
+# Positive value pushes in the +Z direction of the end-effector (down toward table in your case).
+# Start small and test sign if force goes the wrong way.
+WRENCH = [0.0, 0.0, 10.0, 0.0, 0.0, 0.0]  # 5 N in tool Z (normal)
 
 # Set this to True when testing the motion sequence in open air (no surface).
 # This makes force_mode compliant in the set axes but with ZERO force targets,
 # so the arm does not actively drive/drift trying to "push" with nonzero forces.
-# Set to False only when the start pose itself will put the tool in contact with a real surface.
-FREE_AIR_TEST = True
+# Set to False only when the start pose itself will put the tool in (or very near) contact
+# with a real surface so that the force controller can regulate against a real reaction.
+FREE_AIR_TEST = False
 
-FORCE_TYPE = 2 # 2 = base/world frame
+FORCE_TYPE = 1 # 1 = tool frame (use this because EE Z is the normal to the table)
 
 # LIMITS for real hardware contact:
 #   - Non-compliant axis: maximum allowed deviation from the commanded path (m)
@@ -78,21 +100,37 @@ LIMITS = [0.10, 0.04, 0.04, 0.17, 0.17, 0.17]
 
 # Force controller tuning - MUST be called before force_mode()
 DAMPING = 0.80         
-GAIN_SCALING = 0.90    
+GAIN_SCALING = 0.70    
 
 # Start pose (joint positions in radians)..
 START_JOINTS = [1.675, -2.219, -0.981, 0.460, 1.525, -0.033]
 
 # End pose (joint positions in radians) for the surface trace motion.
 END_JOINTS = [1.675, -2.451, -1.068, 0.938, 1.525, -0.033]
+
+# Safe retracted pose after tracing (arm raised clear above the table).
+# IMPORTANT: Jog the arm UP to a safe retracted height AFTER a trace (with force off), 
+# then record the joints here. This must be a raised pose so the arm clears the table.
+RETRACT_JOINTS = [1.675, -1.5, -1.2, -0.5, 1.525, -0.033]  # <<< REPLACE WITH YOUR ACTUAL RAISED JOINTS!
 # ================================================================================================
 
 # Motion speeds WHILE FORCE MODE IS ACTIVE (the sliding portion of the trace).
-TRACE_ACC = 0.15
-TRACE_VEL = 0.02
+TRACE_ACC = 0.01
+TRACE_VEL = 0.01
+
+# Lateral trace offset in TOOL / end-effector frame (see Polyscope EE axes).
+# X = left/right on table
+# Y = back/forward on table   <--- set this (second number) for "back"
+# Z must be 0 (to keep commanded motion at constant height; force_mode handles Z)
+TRACE_LATERAL_OFFSET = [-0.09, 0.3, 0.0]  # example: 15 cm in tool +Y; use negative for opposite direction
 
 # Dwell at the end pose with force_mode still active.
-POST_TRACE_DWELL = 2.0
+POST_TRACE_DWELL = 1.0
+
+# Seconds to wait after enabling force_mode (and after zero_ftsensor) for the initial press
+# to stabilize before issuing the trace motion command. Prevents the slide from fighting
+# the engagement transient.
+PRESS_SETTLE_TIME = 1.0
 
 
 def send_script(script: str, host: str = HOST, port: int = 30002, timeout: float = 5.0):
@@ -120,51 +158,75 @@ def main():
     print("Zero external dependencies - uses only Python stdlib sockets.")
     print()
     print("Force mode params:")
-    print(f"  Selection: {SELECTION}")
+    print(f"  Selection: {SELECTION} (in TOOL frame: Z = normal to table)")
     print(f"  Wrench:    {WRENCH}")
-    print(f"  Type:      {FORCE_TYPE}")
+    print(f"  Type:      {FORCE_TYPE} (tool frame)")
     print(f"  Damping:   {DAMPING}")
     print(f"  Gain:      {GAIN_SCALING}")
+    print(f"  Trace offset: {TRACE_LATERAL_OFFSET} (in TOOL/EE frame: Y for back/forward on table)")
     print(f"Start joints (rad): {START_JOINTS}")
     print(f"End joints (rad):   {END_JOINTS}")
+    print(f"Retract joints (rad): {RETRACT_JOINTS}")
     print()
     print("IMPORTANT:")
     print("  - Robot must be powered on and in REMOTE mode in Polyscope.")
     print("  - Correct TCP and payload must be configured for accurate TCP wrench.")
-    print("  - Approach: 0 mm additional move (force_mode enabled directly after reaching start pose + sleep).")
-    print("  - FREE_AIR_TEST = True (top of file) → zero force targets for open-air motion testing (no drift).")
-    print("  - Set FREE_AIR_TEST = False only when the start pose itself will load the tool against a real surface.")
+    print("  - Using TOOL frame (FORCE_TYPE=1): SELECTION[2]=1 means compliance in EE Z (normal to table).")
+    print("  - Trace offset in TOOL/EE frame (set Y component for back/forward; Z must stay 0).")
+    print("  - After trace + dwell: end_force_mode() then movej(RETRACT_JOINTS) -- set RETRACT_JOINTS (at top) to a safe raised pose to retract the *entire* arm clear of table.")
+    print("  - 0 mm approach: force_mode enabled after start pose.")
+    print("  - FREE_AIR_TEST = True for testing the trace motion without force.")
     print("  - Have the teach pendant E-stop accessible. Start in reduced speed mode.")
     print("Press Ctrl-C to stop and cleanly disable force mode.\n")
 
     # 1. Enable force mode + perform the trace via URScript on port 30002.
-    # Sequence:
-    #   - Reach start pose
-    #   - 0 mm additional approach (no down move)
-    #   - Then trace while force_mode is active (Z compliant with force target)
+    # Sequence (executed on the robot):
+    #   - Reach start pose (must put tool in light contact for real-surface use)
+    #   - 0 mm movel (placeholder)
+    #   - zero_ftsensor()
+    #   - force_mode in TOOL frame (SELECTION[2]=1 means EE Z = table normal)
+    #   - Settle
+    #   - speedl in TOOL Y (back/forward) -- straighter tangential motion
+    #   - Dwell
+    #   - end_force_mode()
+    #   - movej(RETRACT_JOINTS) -- retract entire arm to safe raised pose
+    #   - stopl
     #
-    # Note: With 0 mm approach, the start pose itself must position the tool in contact
-    # with the surface (when FREE_AIR_TEST=False) so the surface can react to the force targets.
+    # Key: compliance (force control) in EE Z (normal to table), commanded velocity in EE Y.
     effective_wrench = [0.0, 0.0, 0.0, 0.0, 0.0, 0.0] if FREE_AIR_TEST else WRENCH
+
+    # Precompute for the trace: use TRACE_LATERAL_OFFSET as the desired displacement in TOOL frame
+    # (X=left/right, Y=back/forward, Z must be 0)
+    offset = TRACE_LATERAL_OFFSET[:3]
+    mag = (offset[0]**2 + offset[1]**2 + offset[2]**2) ** 0.5
+    if mag < 0.0001:
+        mag = 1.0
+    unit_x = offset[0] / mag
+    unit_y = offset[1] / mag
+    unit_z = offset[2] / mag
+    trace_speed = TRACE_VEL
+    trace_dist = mag
+    trace_time = trace_dist / trace_speed if trace_speed > 0 else 1.0
 
     force_script = f"""
 def force_trace_real():
-    # 1. Move to the taught start pose (position the tool near the surface).
+    # 1. Move to the taught start pose (must place tool in light contact for real use).
     movej([{START_JOINTS[0]}, {START_JOINTS[1]}, {START_JOINTS[2]}, {START_JOINTS[3]}, {START_JOINTS[4]}, {START_JOINTS[5]}], a=1.0, v=0.5)
     sleep(1.0)
 
-    # 2. APPROACH: 0 mm additional move (no down). 
-    approach = p[0.0, 0.0, 0.0, 0.0, 0.0, 0.0]   # 0 mm
+    # 2. 0 mm approach placeholder (no extra motion).
+    approach = p[0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
     movel(pose_add(get_actual_tcp_pose(), approach), a=0.12, v=0.025)
-    sleep(0.5)   # short settle pause.
+    sleep(0.5)
 
-    # 3. Zero the force/torque sensor (ideally while the tool is in light contact with the surface at the start pose).
+    # 3. Zero sensor (while in light contact).
     zero_ftsensor()
 
     force_mode_set_damping({DAMPING})
     force_mode_set_gain_scaling({GAIN_SCALING})
 
-    # 4. Enable force mode.
+    # 4. Enable force mode (Z compliant + target wrench).
+    textmsg("FORCE_MODE_ENABLED")
     force_mode(
         p[{TASK_FRAME[0]},{TASK_FRAME[1]},{TASK_FRAME[2]},{TASK_FRAME[3]},{TASK_FRAME[4]},{TASK_FRAME[5]}],
         [{SELECTION[0]},{SELECTION[1]},{SELECTION[2]},{SELECTION[3]},{SELECTION[4]},{SELECTION[5]}],
@@ -173,23 +235,50 @@ def force_trace_real():
         [{LIMITS[0]},{LIMITS[1]},{LIMITS[2]},{LIMITS[3]},{LIMITS[4]},{LIMITS[5]}]
     )
 
-    # 5. Trace / slide to end pose while force_mode is active.
-    #    IMPORTANT: Because Z is compliant, the force controller will continuously
-    #    adjust the position/velocity in Z to achieve the target wrench.
-    #    The movej will be followed primarily in the non-compliant axes (X, Y + rotations).
-    #    If the taught end joints require a Z position that conflicts with
-    #    maintaining 5N, the arm will deviate from the pure joint trajectory (this appears as "drift").
-    #    This is expected behavior. The arm is trying to satisfy the force targets.
-    movej([{END_JOINTS[0]}, {END_JOINTS[1]}, {END_JOINTS[2]}, {END_JOINTS[3]}, {END_JOINTS[4]}, {END_JOINTS[5]}], a={TRACE_ACC}, v={TRACE_VEL})
+    # Let the initial press build and stabilize before we command lateral motion.
+    sleep({PRESS_SETTLE_TIME})
+    textmsg("SETTLED_PRESS")
 
-    # Dwell at the end with force mode still active.
+    # 5. Trace with speedl using direction from TRACE_LATERAL_OFFSET in TOOL frame (EE axes).
+    #    While force_mode regulates tool Z (normal to surface).
+    #    The offset you set (e.g. Y component for back/forward) is transformed to base velocity.
+    textmsg("STARTING_TRACE")
+    pressed = get_actual_tcp_pose()
+    # Direction in TOOL frame from the offset the user set (EE X/Y/Z as per Polyscope)
+    dir_tool = p[{unit_x}, {unit_y}, {unit_z}, 0,0,0]
+    rot_pose = p[0,0,0, pressed[3],pressed[4],pressed[5]]
+    dir_base = pose_trans(rot_pose, dir_tool)
+    speed = {trace_speed}
+    vx = dir_base[0] * speed
+    vy = dir_base[1] * speed
+    vz = dir_base[2] * speed   # should be 0 if user set Z=0 in offset
+    vel = [vx, vy, vz, 0, 0, 0]
+    acc = 0.5
+    t = {trace_time}
+    speedl(vel, acc, t)
+    textmsg("TRACE_COMPLETE")
+
+    # Optional: if you really need the exact END_JOINTS posture *after* tracing under force,
+    # you can do the joint move *after* end_force_mode() below instead.
+
+    # Dwell while still under force (good for observing stable regulation).
     sleep({POST_TRACE_DWELL})
 
     end_force_mode()
-    stopl(1.5)
+    textmsg("RETRACTING")
+
+    # Retract the entire arm up and clear of the table to RETRACT_JOINTS.
+    # This is a full joint-space retract (safer than small Cartesian lift after contact/trace).
+    # Jog arm UP to clear height AFTER a trace (force off), record joints, and put them in RETRACT_JOINTS at top.
+    movej([{RETRACT_JOINTS[0]}, {RETRACT_JOINTS[1]}, {RETRACT_JOINTS[2]}, {RETRACT_JOINTS[3]}, {RETRACT_JOINTS[4]}, {RETRACT_JOINTS[5]}], a=0.5, v=0.2)
+    stopl(1.0)
 end
 force_trace_real()
 """
+
+    print("=== Generated URScript (for debugging - copy if robot errors) ===")
+    print(force_script)
+    print("=== End of generated URScript ===")
 
     print("Sending force_mode + trace command via port 30002 ...")
     if not send_script(force_script):
