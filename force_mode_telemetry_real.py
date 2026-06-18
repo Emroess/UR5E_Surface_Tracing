@@ -58,30 +58,8 @@ SELECTION = [0, 0, 1, 0, 0, 0]
 #   [3] = Rx  (rotation about X)
 #   [4] = Ry  (rotation about Y)
 #   [5] = Rz  (rotation about Z)
-# 1 = compliant/force-controlled (this is the normal to the table); 0 = position-controlled (for tracing motion).
 
-# TASK_FRAME vs WRENCH (in force_mode):
-# - TASK_FRAME: A 6D pose that defines the *reference frame* (origin + orientation)
-#   in which the force control axes are interpreted. It orients the "coordinate system"
-#   for both SELECTION and WRENCH.
-#   With FORCE_TYPE=1 it is usually left as [0,0,0,0,0,0] and the axes follow the current
-#   tool frame at runtime.
-#
-# - WRENCH: The *desired force/torque values* [Fx, Fy, Fz, Tx, Ty, Tz] (N and Nm) that
-#   the robot should apply to the environment.
-#   Only the components where SELECTION=1 are actively regulated to these values.
-#   The other components are ignored for force control.
-#
-# In your current setup (tool frame + Z compliant):
-#   SELECTION[2]=1  → Z axis of the end-effector is force-controlled
-#   WRENCH[2]=5.0   → try to apply 5 N along the tool Z direction (normal to table)
-#   TASK_FRAME is [0,0,0,...] and FORCE_TYPE=1 → the wrench is expressed in the tool frame.
-
-# Real surface targets (used when FREE_AIR_TEST = False)
-# With tool frame: the third component is force in EE Z (normal to table).
-# Positive value pushes in the +Z direction of the end-effector (down toward table in your case).
-# Start small and test sign if force goes the wrong way.
-WRENCH = [0.0, 0.0, 10.0, 0.0, 0.0, 0.0]  # 5 N in tool Z (normal)
+WRENCH = [0.0, 0.0, 10.0, 0.0, 0.0, 0.0]  
 
 # Set this to True when testing the motion sequence in open air (no surface).
 # This makes force_mode compliant in the set axes but with ZERO force targets,
@@ -95,8 +73,7 @@ FORCE_TYPE = 1 # 1 = tool frame (use this because EE Z is the normal to the tabl
 # LIMITS for real hardware contact:
 #   - Non-compliant axis: maximum allowed deviation from the commanded path (m)
 #   - Compliant axes: maximum speed the force controller is allowed to use to correct the force error (m/s)
-#     Keep these LOW when two axes are compliant to avoid fast diving or oscillation.
-LIMITS = [0.10, 0.04, 0.04, 0.17, 0.17, 0.17]
+LIMITS = [0.10, 0.04, 0.08 0.17, 0.17, 0.17]
 
 # Force controller tuning - MUST be called before force_mode()
 DAMPING = 0.80         
