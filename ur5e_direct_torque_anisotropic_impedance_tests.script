@@ -1,0 +1,531 @@
+# ur5e_direct_torque_anisotropic_impedance_tests.script
+# Target: UR5e, PolyScope 5.25.1
+#
+# Purpose:
+#   Stage-by-stage commissioning of direct_torque() and a simple
+#   base-frame anisotropic Cartesian impedance controller.
+#
+# Edit TEST_ID and run one test at a time:
+#
+#   0 = zero extra torque test
+#   1 = joint damping only
+#   2 = joint-space anisotropic impedance hold
+#   3 = base-frame Cartesian anisotropic impedance hold
+#   4 = base-frame Cartesian anisotropic impedance with small +X bias
+#
+# TEST_ID 4 intentionally moves the TCP equilibrium. To run it, also set
+# ALLOW_TEST_4_BIASED_MOTION = True after tests 0 through 3 have passed.
+#
+# This script does NOT:
+#   - set payload
+#   - set TCP
+#   - tare the force/torque sensor
+#   - use RTDE
+#   - use sockets
+#   - perform surface-frame control
+#   - control orientation impedance
+#
+# The active installation payload and TCP must already be correct.
+
+TEST_ID = 0
+ALLOW_TEST_4_BIASED_MOTION = False
+
+
+def clamp(x, lo, hi):
+  if x < lo:
+    return lo
+  elif x > hi:
+    return hi
+  else:
+    return x
+  end
+end
+
+
+def clamp_rate(target, last, delta_lim):
+  delta = target - last
+
+  if delta > delta_lim:
+    return last + delta_lim
+  elif delta < -delta_lim:
+    return last - delta_lim
+  else:
+    return target
+  end
+end
+
+
+def abs_gt(x, lim):
+  if x > lim:
+    return True
+  elif x < -lim:
+    return True
+  else:
+    return False
+  end
+end
+
+
+def any_joint_error_exceeds(q, q_ref, q_err_lim):
+  i = 0
+  while i < 6:
+    if abs_gt(q[i] - q_ref[i], q_err_lim[i]):
+      return True
+    end
+    i = i + 1
+  end
+
+  return False
+end
+
+
+def report_stop_reason(stop_code):
+  if stop_code == 1:
+    textmsg("Stop reason: joint drift guard")
+  elif stop_code == 2:
+    textmsg("Stop reason: Cartesian X error guard")
+  elif stop_code == 3:
+    textmsg("Stop reason: Cartesian Y error guard")
+  elif stop_code == 4:
+    textmsg("Stop reason: Cartesian Z error guard")
+  elif stop_code == 5:
+    textmsg("Stop reason: time limit")
+  else:
+    textmsg("Stop reason: unknown")
+  end
+end
+
+
+def ramp_to_zero_and_stop(tau_last, dtau_lim, viscous_scale, coulomb_scale):
+  # Smoothly ramp extra commanded torque toward zero, then explicitly
+  # return to position-control behavior with stopj().
+  tau = [0, 0, 0, 0, 0, 0]
+  t = 0.0
+
+  while t < 0.25:
+    t = t + get_steptime()
+
+    i = 0
+    while i < 6:
+      tau[i] = clamp_rate(0.0, tau_last[i], dtau_lim[i])
+      i = i + 1
+    end
+
+    direct_torque(
+      tau,
+      viscous_scale=viscous_scale,
+      coulomb_scale=coulomb_scale
+    )
+
+    i = 0
+    while i < 6:
+      tau_last[i] = tau[i]
+      i = i + 1
+    end
+  end
+
+  stopj(2.0)
+end
+
+
+def test_00_zero_extra_torque():
+  textmsg("TEST 0: zero extra torque")
+
+  viscous_scale = [0.9, 0.9, 0.8, 0.9, 0.9, 0.9]
+  coulomb_scale = [0.8, 0.8, 0.7, 0.8, 0.8, 0.8]
+
+  tau = [0, 0, 0, 0, 0, 0]
+  tau_last = [0, 0, 0, 0, 0, 0]
+  dtau_lim = [0.04, 0.04, 0.03, 0.008, 0.008, 0.005]
+
+  # Very small drift guard. This test has no stiffness.
+  q_ref = get_actual_joint_positions()
+  q_err_lim = [0.03, 0.03, 0.03, 0.04, 0.04, 0.05]
+
+  t = 0.0
+  keep_running = True
+  stop_code = 0
+
+  while keep_running:
+    t = t + get_steptime()
+
+    q = get_actual_joint_positions()
+
+    if any_joint_error_exceeds(q, q_ref, q_err_lim):
+      stop_code = 1
+      keep_running = False
+    end
+
+    if t > 1.0:
+      if stop_code == 0:
+        stop_code = 5
+      end
+      keep_running = False
+    end
+
+    if keep_running:
+      direct_torque(
+        tau,
+        viscous_scale=viscous_scale,
+        coulomb_scale=coulomb_scale
+      )
+    end
+  end
+
+  ramp_to_zero_and_stop(tau_last, dtau_lim, viscous_scale, coulomb_scale)
+  report_stop_reason(stop_code)
+  textmsg("TEST 0 finished")
+end
+
+
+def test_01_joint_damping_only():
+  textmsg("TEST 1: joint damping only")
+
+  viscous_scale = [0.9, 0.9, 0.8, 0.9, 0.9, 0.9]
+  coulomb_scale = [0.8, 0.8, 0.7, 0.8, 0.8, 0.8]
+
+  # Joint damping units: Nm / (rad/s)
+  Dq = [0.25, 0.25, 0.18, 0.020, 0.020, 0.012]
+
+  tau_lim = [3.0, 3.0, 2.5, 0.60, 0.60, 0.40]
+  dtau_lim = [0.035, 0.035, 0.025, 0.006, 0.006, 0.004]
+
+  q_ref = get_actual_joint_positions()
+  q_err_lim = [0.08, 0.08, 0.08, 0.10, 0.10, 0.12]
+
+  tau = [0, 0, 0, 0, 0, 0]
+  tau_last = [0, 0, 0, 0, 0, 0]
+
+  t = 0.0
+  keep_running = True
+  stop_code = 0
+
+  while keep_running:
+    t = t + get_steptime()
+
+    q = get_actual_joint_positions()
+    qd = get_actual_joint_speeds()
+
+    if any_joint_error_exceeds(q, q_ref, q_err_lim):
+      stop_code = 1
+      keep_running = False
+    end
+
+    if t > 3.0:
+      if stop_code == 0:
+        stop_code = 5
+      end
+      keep_running = False
+    end
+
+    if keep_running:
+      i = 0
+      while i < 6:
+        raw = -Dq[i] * qd[i]
+        raw = clamp(raw, -tau_lim[i], tau_lim[i])
+        tau[i] = clamp_rate(raw, tau_last[i], dtau_lim[i])
+        i = i + 1
+      end
+
+      direct_torque(
+        tau,
+        viscous_scale=viscous_scale,
+        coulomb_scale=coulomb_scale
+      )
+
+      i = 0
+      while i < 6:
+        tau_last[i] = tau[i]
+        i = i + 1
+      end
+    end
+  end
+
+  ramp_to_zero_and_stop(tau_last, dtau_lim, viscous_scale, coulomb_scale)
+  report_stop_reason(stop_code)
+  textmsg("TEST 1 finished")
+end
+
+
+def test_02_joint_anisotropic_impedance_hold():
+  textmsg("TEST 2: joint-space anisotropic impedance hold")
+
+  viscous_scale = [0.9, 0.9, 0.8, 0.9, 0.9, 0.9]
+  coulomb_scale = [0.8, 0.8, 0.7, 0.8, 0.8, 0.8]
+
+  # Joint stiffness units: Nm/rad
+  # Joint damping units:   Nm/(rad/s)
+  #
+  # These are deliberately low commissioning values.
+  Kq = [2.0, 2.0, 1.5, 0.15, 0.15, 0.08]
+  Dq = [0.35, 0.35, 0.25, 0.030, 0.030, 0.018]
+
+  tau_lim = [4.0, 4.0, 3.0, 0.80, 0.80, 0.50]
+  dtau_lim = [0.040, 0.040, 0.030, 0.008, 0.008, 0.005]
+
+  q_ref = get_actual_joint_positions()
+  q_err_lim = [0.12, 0.12, 0.12, 0.16, 0.16, 0.20]
+  q_err_clip = [0.08, 0.08, 0.08, 0.10, 0.10, 0.12]
+
+  tau = [0, 0, 0, 0, 0, 0]
+  tau_last = [0, 0, 0, 0, 0, 0]
+
+  t = 0.0
+  keep_running = True
+  stop_code = 0
+
+  while keep_running:
+    t = t + get_steptime()
+
+    q = get_actual_joint_positions()
+    qd = get_actual_joint_speeds()
+
+    if any_joint_error_exceeds(q, q_ref, q_err_lim):
+      stop_code = 1
+      keep_running = False
+    end
+
+    if t > 5.0:
+      if stop_code == 0:
+        stop_code = 5
+      end
+      keep_running = False
+    end
+
+    if keep_running:
+      i = 0
+      while i < 6:
+        e = q_ref[i] - q[i]
+        e = clamp(e, -q_err_clip[i], q_err_clip[i])
+
+        raw = Kq[i] * e - Dq[i] * qd[i]
+        raw = clamp(raw, -tau_lim[i], tau_lim[i])
+
+        tau[i] = clamp_rate(raw, tau_last[i], dtau_lim[i])
+
+        i = i + 1
+      end
+
+      direct_torque(
+        tau,
+        viscous_scale=viscous_scale,
+        coulomb_scale=coulomb_scale
+      )
+
+      i = 0
+      while i < 6:
+        tau_last[i] = tau[i]
+        i = i + 1
+      end
+    end
+  end
+
+  ramp_to_zero_and_stop(tau_last, dtau_lim, viscous_scale, coulomb_scale)
+  report_stop_reason(stop_code)
+  textmsg("TEST 2 finished")
+end
+
+
+def cartesian_anisotropic_core(t_run, bias_x, bias_y, bias_z):
+  # Base-frame translational impedance:
+  #
+  #   F = K * (x_ref - x) - D * xdot
+  #   tau = J^T * [Fx, Fy, Fz, 0, 0, 0] - joint damping
+  #
+  # Orientation impedance is intentionally omitted in this first test.
+  # The small joint damping term helps avoid uncontrolled nullspace/wrist motion.
+
+  viscous_scale = [0.9, 0.9, 0.8, 0.9, 0.9, 0.9]
+  coulomb_scale = [0.8, 0.8, 0.7, 0.8, 0.8, 0.8]
+
+  # Cartesian translational stiffness in N/m.
+  # Anisotropic by construction:
+  #   X stiffest, Y moderate, Z softest.
+  #
+  # These are low free-space commissioning values.
+  Kx = 100.0
+  Ky = 60.0
+  Kz = 20.0
+
+  # Cartesian translational damping in N/(m/s).
+  Dx = 20.0
+  Dy = 15.0
+  Dz = 10.0
+
+  # Small joint damping in Nm/(rad/s), added after J^T F.
+  Dq_null = [0.08, 0.08, 0.06, 0.010, 0.010, 0.006]
+
+  tau_lim = [4.0, 4.0, 3.0, 0.80, 0.80, 0.50]
+  dtau_lim = [0.040, 0.040, 0.030, 0.008, 0.008, 0.005]
+
+  # Abort if Cartesian translation error grows beyond these limits.
+  # Units: m.
+  x_err_abort = 0.060
+  y_err_abort = 0.060
+  z_err_abort = 0.060
+
+  # Clip the error used by the virtual spring.
+  # Units: m.
+  x_err_clip = 0.025
+  y_err_clip = 0.025
+  z_err_clip = 0.025
+
+  # Joint-motion guard from starting configuration.
+  q_ref = get_actual_joint_positions()
+  q_err_lim = [0.16, 0.16, 0.16, 0.20, 0.20, 0.25]
+
+  # Capture current TCP pose as the equilibrium pose.
+  # This uses the active TCP.
+  p0 = get_actual_tcp_pose()
+
+  x_ref = p0[0] + bias_x
+  y_ref = p0[1] + bias_y
+  z_ref = p0[2] + bias_z
+
+  tau = [0, 0, 0, 0, 0, 0]
+  tau_last = [0, 0, 0, 0, 0, 0]
+
+  t = 0.0
+  keep_running = True
+  stop_code = 0
+
+  while keep_running:
+    t = t + get_steptime()
+
+    q = get_actual_joint_positions()
+    qd = get_actual_joint_speeds()
+
+    if any_joint_error_exceeds(q, q_ref, q_err_lim):
+      stop_code = 1
+      keep_running = False
+    end
+
+    p = get_actual_tcp_pose()
+    xd = get_actual_tcp_speed()
+
+    ex = x_ref - p[0]
+    ey = y_ref - p[1]
+    ez = z_ref - p[2]
+
+    if abs_gt(ex, x_err_abort):
+      if stop_code == 0:
+        stop_code = 2
+      end
+      keep_running = False
+    end
+
+    if abs_gt(ey, y_err_abort):
+      if stop_code == 0:
+        stop_code = 3
+      end
+      keep_running = False
+    end
+
+    if abs_gt(ez, z_err_abort):
+      if stop_code == 0:
+        stop_code = 4
+      end
+      keep_running = False
+    end
+
+    if t > t_run:
+      if stop_code == 0:
+        stop_code = 5
+      end
+      keep_running = False
+    end
+
+    if keep_running:
+      ex_used = clamp(ex, -x_err_clip, x_err_clip)
+      ey_used = clamp(ey, -y_err_clip, y_err_clip)
+      ez_used = clamp(ez, -z_err_clip, z_err_clip)
+
+      Fx = Kx * ex_used - Dx * xd[0]
+      Fy = Ky * ey_used - Dy * xd[1]
+      Fz = Kz * ez_used - Dz * xd[2]
+
+      # Jacobian for the active TCP at the current joint state.
+      J = get_jacobian(q)
+
+      # tau = J^T * [Fx, Fy, Fz, 0, 0, 0] - Dq_null * qdot
+      #
+      # Assuming J rows correspond to [vx, vy, vz, wx, wy, wz]
+      # and columns correspond to joints [0..5].
+      raw0 = J[0,0] * Fx + J[1,0] * Fy + J[2,0] * Fz - Dq_null[0] * qd[0]
+      raw1 = J[0,1] * Fx + J[1,1] * Fy + J[2,1] * Fz - Dq_null[1] * qd[1]
+      raw2 = J[0,2] * Fx + J[1,2] * Fy + J[2,2] * Fz - Dq_null[2] * qd[2]
+      raw3 = J[0,3] * Fx + J[1,3] * Fy + J[2,3] * Fz - Dq_null[3] * qd[3]
+      raw4 = J[0,4] * Fx + J[1,4] * Fy + J[2,4] * Fz - Dq_null[4] * qd[4]
+      raw5 = J[0,5] * Fx + J[1,5] * Fy + J[2,5] * Fz - Dq_null[5] * qd[5]
+
+      raw0 = clamp(raw0, -tau_lim[0], tau_lim[0])
+      raw1 = clamp(raw1, -tau_lim[1], tau_lim[1])
+      raw2 = clamp(raw2, -tau_lim[2], tau_lim[2])
+      raw3 = clamp(raw3, -tau_lim[3], tau_lim[3])
+      raw4 = clamp(raw4, -tau_lim[4], tau_lim[4])
+      raw5 = clamp(raw5, -tau_lim[5], tau_lim[5])
+
+      tau[0] = clamp_rate(raw0, tau_last[0], dtau_lim[0])
+      tau[1] = clamp_rate(raw1, tau_last[1], dtau_lim[1])
+      tau[2] = clamp_rate(raw2, tau_last[2], dtau_lim[2])
+      tau[3] = clamp_rate(raw3, tau_last[3], dtau_lim[3])
+      tau[4] = clamp_rate(raw4, tau_last[4], dtau_lim[4])
+      tau[5] = clamp_rate(raw5, tau_last[5], dtau_lim[5])
+
+      direct_torque(
+        tau,
+        viscous_scale=viscous_scale,
+        coulomb_scale=coulomb_scale
+      )
+
+      tau_last[0] = tau[0]
+      tau_last[1] = tau[1]
+      tau_last[2] = tau[2]
+      tau_last[3] = tau[3]
+      tau_last[4] = tau[4]
+      tau_last[5] = tau[5]
+    end
+  end
+
+  ramp_to_zero_and_stop(tau_last, dtau_lim, viscous_scale, coulomb_scale)
+  return stop_code
+end
+
+
+def test_03_cartesian_anisotropic_hold():
+  textmsg("TEST 3: Cartesian anisotropic base-frame hold")
+  stop_code = cartesian_anisotropic_core(5.0, 0.0, 0.0, 0.0)
+  report_stop_reason(stop_code)
+  textmsg("TEST 3 finished")
+end
+
+
+def test_04_cartesian_anisotropic_x_bias():
+  textmsg("TEST 4: Cartesian anisotropic base-frame +X bias")
+
+  # This introduces a tiny +X equilibrium shift in the robot base frame.
+  # The robot may move. Use only after tests 0 through 3 pass.
+  stop_code = cartesian_anisotropic_core(4.0, 0.003, 0.0, 0.0)
+  report_stop_reason(stop_code)
+
+  textmsg("TEST 4 finished")
+end
+
+
+if TEST_ID == 0:
+  test_00_zero_extra_torque()
+elif TEST_ID == 1:
+  test_01_joint_damping_only()
+elif TEST_ID == 2:
+  test_02_joint_anisotropic_impedance_hold()
+elif TEST_ID == 3:
+  test_03_cartesian_anisotropic_hold()
+elif TEST_ID == 4:
+  if ALLOW_TEST_4_BIASED_MOTION:
+    test_04_cartesian_anisotropic_x_bias()
+  else:
+    popup("TEST 4 requires ALLOW_TEST_4_BIASED_MOTION = True.", title="Torque test", error=True, blocking=True)
+  end
+else:
+  popup("Invalid TEST_ID. Use 0, 1, 2, 3, or 4.", title="Torque test", error=True, blocking=True)
+end
